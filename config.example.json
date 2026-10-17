@@ -1,0 +1,152 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "https",
+        "tag": "remote-dns",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "cloudflare-dns.com"
+        },
+        "detour": "proxy"
+      },
+      {
+        "type": "https",
+        "tag": "bootstrap-dns",
+        "server": "223.5.5.5",
+        "server_port": 443,
+        "path": "/dns-query",
+        "tls": {
+          "enabled": true,
+          "server_name": "dns.alidns.com"
+        }
+      }
+    ],
+    "final": "remote-dns",
+    "strategy": "prefer_ipv4",
+    "reverse_mapping": true,
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "action": "route",
+        "server": "bootstrap-dns"
+      },
+      {
+        "domain_suffix": [
+          "cn",
+          "xn--fiqs8s"
+        ],
+        "action": "route",
+        "server": "bootstrap-dns"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "gateway",
+      "listen": "::",
+      "listen_port": 7893
+    },
+    {
+      "type": "mixed",
+      "tag": "local-test",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "proxy",
+      "connect_timeout": "10s"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": [
+          "gateway"
+        ],
+        "port": 53,
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "100.64.0.0/10",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "255.255.255.255/32",
+          "fe80::/10",
+          "ff00::/8",
+          "fd7a:115c:a1e0::/48"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "action": "sniff"
+      },
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "cn",
+          "xn--fiqs8s"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "action": "resolve",
+        "strategy": "prefer_ipv4"
+      },
+      {
+        "rule_set": [
+          "geoip-cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy",
+    "default_domain_resolver": "bootstrap-dns",
+    "rule_set": [
+      {
+        "type": "local",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "path": "rule-set/geosite-cn.srs"
+      },
+      {
+        "type": "local",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "path": "rule-set/geoip-cn.srs"
+      }
+    ]
+  }
+}

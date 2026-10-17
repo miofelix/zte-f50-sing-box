@@ -1,0 +1,465 @@
+#!/system/bin/sh
+# Reversible sing-box gateway. Optional boot hooks never touch boot partitions.
+set -u
+PATH=/system/bin:/system/xbin:/system/sbin
+export PATH
+umask 077
+say() { printf '%s\n' "$*"; }
+die() { say "ERROR: $*" >&2; exit 1; }
+BASE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+SELF="$BASE/f50-proxy"
+CORE="$BASE/sing-box"
+RUN="$BASE/run"
+LOG="$BASE/log"
+# Device parameters are validated by deploy.py. The defaults describe ZTE F50
+# when profile.conf is absent.
+PROFILE_FILE="$BASE/profile.conf"
+MARK=0x40000000/0x40000000
+TABLE=20250
+PREF=1000
+PORT=7893
+LOCAL_PORT=7890
+LAN=br0
+CHAIN_PREFIX=F50SB
+
+read_profile() {
+    profile_line=''
+    profile_key=''
+    profile_value=''
+    while IFS= read -r profile_line || [ -n "$profile_line" ]; do
+        case "$profile_line" in
+            ''|\#*) continue;;
+        esac
+        case "$profile_line" in
+            *=*) profile_key=${profile_line%%=*}; profile_value=${profile_line#*=};;
+            *) return 1;;
+        esac
+        case "$profile_key" in
+            PROFILE_NAME|REMOTE_ROOT|LAN_INTERFACE|TPROXY_PORT|LOCAL_TEST_PORT|MARK|ROUTE_TABLE|RULE_PRIORITY|CHAIN_PREFIX) :;;
+            *) return 1;;
+        esac
+        case "$profile_value" in
+            ''|*[!A-Za-z0-9_./:-]*) return 1;;
+        esac
+        case "$profile_key" in
+            MARK) MARK=$profile_value;;
+            ROUTE_TABLE) TABLE=$profile_value;;
+            RULE_PRIORITY) PREF=$profile_value;;
+            TPROXY_PORT) PORT=$profile_value;;
+            LOCAL_TEST_PORT) LOCAL_PORT=$profile_value;;
+            LAN_INTERFACE) LAN=$profile_value;;
+            CHAIN_PREFIX) CHAIN_PREFIX=$profile_value;;
+        esac
+    done < "$PROFILE_FILE"
+    case "$PORT" in ''|*[!0-9]*) return 1;; esac
+    case "$TABLE" in ''|*[!0-9]*) return 1;; esac
+    case "$PREF" in ''|*[!0-9]*) return 1;; esac
+    case "$LOCAL_PORT" in ''|*[!0-9]*) return 1;; esac
+    case "$MARK" in 0x*/0x*) :;; *) return 1;; esac
+    case "$CHAIN_PREFIX" in ''|*[!A-Za-z0-9_]*) return 1;; esac
+    [ "${#CHAIN_PREFIX}" -le 20 ] || return 1
+    return 0
+}
+
+if [ -r "$PROFILE_FILE" ] && ! read_profile; then
+    die 'Invalid device profile; refusing to alter networking.'
+fi
+PRE_CHAIN=${CHAIN_PREFIX}_PRE
+IN_CHAIN=${CHAIN_PREFIX}_IN
+NAT_CHAIN=${CHAIN_PREFIX}_NAT
+
+ipt() { iptables_command=$1; shift; "$iptables_command" -w 5 "$@"; }
+monotonic() {
+    read -r uptime ignored < /proc/uptime
+    printf '%s\n' "${uptime%%.*}"
+}
+guard_alive() {
+    [ -r "$RUN/watchdog.pid" ] && [ -r "$RUN/session" ] || return 1
+    guard=$(cat "$RUN/watchdog.pid")
+    token=$(cat "$RUN/session")
+    case "$guard" in ''|*[!0-9]*) return 1;; esac
+    guard_command=$(tr '\000' '|' < "/proc/$guard/cmdline" 2>/dev/null) || return 1
+    case "$guard_command" in *"|$SELF|_watchdog|$token|"*) kill -0 "$guard" 2>/dev/null;; *) return 1;; esac
+}
+
+core_alive() {
+    [ -r "$RUN/core.pid" ] || return 1
+    CPID=$(cat "$RUN/core.pid")
+    case "$CPID" in ''|*[!0-9]*) return 1;; esac
+    [ "$(readlink "/proc/$CPID/exe" 2>/dev/null)" = "$CORE" ] || return 1
+    kill -0 "$CPID" 2>/dev/null
+}
+
+owned_left() {
+    for family in iptables ip6tables; do
+        ipt "$family" -t mangle -S $PRE_CHAIN >/dev/null 2>&1 && return 0
+        ipt "$family" -t filter -S $IN_CHAIN >/dev/null 2>&1 && return 0
+    done
+    ipt iptables -t nat -S $NAT_CHAIN >/dev/null 2>&1 && return 0
+    for family in -4 -6; do
+        ip "$family" rule show | grep -q "^$PREF:" && return 0
+        [ -z "$(ip "$family" route show table "$TABLE" 2>/dev/null)" ] || return 0
+    done
+    return 1
+}
+
+detach() {
+    # Stop intercepting first; never flush built-in/foreign chains or whole tables.
+    for family in iptables ip6tables; do
+        while ipt "$family" -t mangle -C PREROUTING -i "$LAN" -j $PRE_CHAIN 2>/dev/null; do
+            ipt "$family" -t mangle -D PREROUTING -i "$LAN" -j $PRE_CHAIN || return 1
+        done
+    done
+    for family in iptables ip6tables; do
+        while ipt "$family" -t filter -C INPUT -j $IN_CHAIN 2>/dev/null; do
+            ipt "$family" -t filter -D INPUT -j $IN_CHAIN || return 1
+        done
+    done
+    while ipt iptables -t nat -C PREROUTING -i "$LAN" -j $NAT_CHAIN 2>/dev/null; do
+        ipt iptables -t nat -D PREROUTING -i "$LAN" -j $NAT_CHAIN || return 1
+    done
+    for family in -4 -6; do
+        ip "$family" rule del priority "$PREF" iif "$LAN" fwmark "$MARK" table "$TABLE" 2>/dev/null || :
+    done
+    ip -4 route del local 0.0.0.0/0 dev lo table "$TABLE" 2>/dev/null || :
+    ip -6 route del local ::/0 dev lo table "$TABLE" 2>/dev/null || :
+    for family in iptables ip6tables; do
+        if ipt "$family" -t mangle -S $PRE_CHAIN >/dev/null 2>&1; then
+            ipt "$family" -t mangle -F $PRE_CHAIN || return 1
+            ipt "$family" -t mangle -X $PRE_CHAIN || return 1
+        fi
+        if ipt "$family" -t filter -S $IN_CHAIN >/dev/null 2>&1; then
+            ipt "$family" -t filter -F $IN_CHAIN || return 1
+            ipt "$family" -t filter -X $IN_CHAIN || return 1
+        fi
+    done
+    if ipt iptables -t nat -S $NAT_CHAIN >/dev/null 2>&1; then
+        ipt iptables -t nat -F $NAT_CHAIN || return 1
+        ipt iptables -t nat -X $NAT_CHAIN || return 1
+    fi
+    ! owned_left
+}
+
+stop_core() {
+    if core_alive; then
+        kill "$CPID" || return 1
+        n=0
+        while core_alive && [ "$n" -lt 5 ]; do sleep 1; n=$((n + 1)); done
+        if core_alive; then
+            # Only a PID whose executable is exactly our private core can be killed.
+            kill -KILL "$CPID" || return 1
+        fi
+    fi
+    rm -f "$RUN/core.pid"
+}
+
+stop_all() {
+    if [ -f "$RUN/owned" ]; then
+        detach || { say 'Cleanup incomplete; keeping ownership record. Retry stop.' >&2; return 1; }
+        rm -f "$RUN/owned"
+    fi
+    stop_core || return 1
+    rm -f "$RUN/session" "$RUN/deadline" "$RUN/watchdog.pid"
+    say 'Stopped. Original forwarding and DNS rules remain in effect.'
+}
+
+autostart_metadata() {
+    AUTOSTART_BACKEND=none
+    AUTOSTART_HOOK=none
+    [ -r "$BASE/autostart.conf" ] || return 0
+    while IFS='=' read -r autostart_key autostart_value; do
+        case "$autostart_key" in
+            AUTOSTART_BACKEND)
+                case "$autostart_value" in external-script|none) AUTOSTART_BACKEND=$autostart_value;; *) return 1;; esac;;
+            AUTOSTART_HOOK)
+                case "$autostart_value" in
+                    none) :;;
+                    /data/*|/sdcard/*)
+                        case "$autostart_value" in *[!A-Za-z0-9_./-]*|*/../*|*/./*) return 1;; esac;;
+                    *) return 1;;
+                esac
+                AUTOSTART_HOOK=$autostart_value;;
+            *) return 1;;
+        esac
+    done < "$BASE/autostart.conf"
+}
+
+autostart_status() {
+    autostart_metadata || die 'Invalid autostart metadata.'
+    if [ "$AUTOSTART_BACKEND" = none ]; then say 'autostart: unavailable (no boot adapter)'
+    elif [ -e "$BASE/autostart.disabled" ]; then say 'autostart: off'; else say 'autostart: on (default)'; fi
+    say "boot backend: $AUTOSTART_BACKEND"
+    say "boot hook: $AUTOSTART_HOOK"
+    if [ -r "$RUN/boot.result" ]; then say "last boot: $(cat "$RUN/boot.result")"; fi
+}
+
+autostart_switch() {
+    case "${1:-status}" in
+        on)
+            autostart_metadata || return 1
+            [ "$AUTOSTART_BACKEND" = external-script ] && [ -x "$BASE/boot-start.sh" ] && \
+                [ -r "$AUTOSTART_HOOK" ] && \
+                grep -Fqx '# BEGIN ZTE-F50-SINGBOX AUTOSTART' "$AUTOSTART_HOOK" && \
+                grep -Fq "$BASE/boot-start.sh" "$AUTOSTART_HOOK" || {
+                    say 'Boot hook is not installed. Run: python3 deploy.py autostart on' >&2; return 1;
+                }
+            rm -f "$BASE/autostart.disabled"
+            say 'Autostart enabled. The current gateway session is unchanged.';;
+        off)
+            printf '%s\n' disabled > "$BASE/.autostart.disabled.$$"
+            mv -f "$BASE/.autostart.disabled.$$" "$BASE/autostart.disabled"
+            say 'Autostart disabled. The current gateway session is unchanged.';;
+        status) autostart_status;;
+        *) say 'Usage: f50-proxy autostart {on|off|status}' >&2; return 1;;
+    esac
+}
+
+confirm_session() {
+    [ -f "$RUN/owned" ] && core_alive || die 'No live gateway session.'
+    deadline=$(cat "$RUN/deadline")
+    [ "$deadline" = 0 ] || [ "$(monotonic)" -lt "$deadline" ] || die 'Lease has expired; start again.'
+    guard_alive || die 'Session watchdog is not running.'
+    echo 0 > "$RUN/deadline.new"
+    mv -f "$RUN/deadline.new" "$RUN/deadline"
+    say 'Confirmed. Watchdog keeps monitoring the core.'
+}
+
+preflight() {
+    [ "$(id -u)" = 0 ] || die 'Root is required.'
+    [ -x "$CORE" ] || die 'Missing executable sing-box.'
+    [ -r "$BASE/config.json" ] || die 'Install a native config.json first.'
+    "$CORE" check -D "$BASE" -c "$BASE/config.json" || die 'Native config check failed.'
+    ip link show dev "$LAN" >/dev/null 2>&1 || die "$LAN is unavailable."
+    for family in iptables ip6tables; do
+        ipt "$family" -t mangle -S >/dev/null || die "$family mangle unavailable."
+    done
+    grep -q '^TPROXY$' /proc/net/ip_tables_targets || die 'IPv4 TPROXY unavailable.'
+    grep -q '^TPROXY$' /proc/net/ip6_tables_targets || die 'IPv6 TPROXY unavailable.'
+}
+
+assert_vacant() {
+    [ ! -e "$RUN/owned" ] || die 'Gateway session exists; run stop first.'
+    core_alive && die 'Core already running; use restart.'
+    owned_left && die 'Reserved chain, priority 1000 or table 20250 is in use; refusing to alter it.'
+    if ss -lntu | grep -q ":$PORT "; then die "Port $PORT is already in use."; fi
+}
+
+capture_rule() {
+    tp_family=$1
+    tp_protocol=$2
+    shift 2
+    ipt "$tp_family" -t mangle -A $PRE_CHAIN -p "$tp_protocol" "$@" \
+        -j TPROXY --on-port "$PORT" --tproxy-mark "$MARK"
+}
+
+build_family() {
+    family=$1
+    ipt "$family" -t mangle -N $PRE_CHAIN || return 1
+    ipt "$family" -t filter -N $IN_CHAIN || return 1
+    # Keep MagicDNS and tailnet access on their existing paths, including port 53.
+    if [ "$family" = iptables ]; then
+        ipt "$family" -t mangle -A $PRE_CHAIN -d 100.64.0.0/10 -j RETURN || return 1
+    else
+        ipt "$family" -t mangle -A $PRE_CHAIN -d fd7a:115c:a1e0::/48 -j RETURN || return 1
+    fi
+    # Gateway/private DNS must be intercepted before local/private bypass rules.
+    capture_rule "$family" tcp --dport 53 || return 1
+    capture_rule "$family" udp --dport 53 || return 1
+    if [ "$family" = iptables ]; then address_family=-4; else address_family=-6; fi
+    # This Android image has no xt_addrtype userspace extension. Snapshot actual
+    # local host addresses instead; private/link-local bypasses also stay below.
+    local_addresses=$(ip "$address_family" -o addr show | awk '{print $4}')
+    [ -n "$local_addresses" ] || return 1
+    for local_address in $local_addresses; do
+        ipt "$family" -t mangle -A $PRE_CHAIN -d "${local_address%/*}" -j RETURN || return 1
+    done
+    if [ "$family" = iptables ]; then
+        ranges='0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4'
+    else
+        ranges='::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8'
+    fi
+    for subnet in $ranges; do
+        ipt "$family" -t mangle -A $PRE_CHAIN -d "$subnet" -j RETURN || return 1
+    done
+    capture_rule "$family" tcp || return 1
+    capture_rule "$family" udp || return 1
+    for protocol in tcp udp; do
+        # netd overwrites packet marks in mangle INPUT; match the assigned socket.
+        # --nowildcard is needed because the TPROXY listener binds to [::].
+        ipt "$family" -t filter -A $IN_CHAIN -i "$LAN" -p "$protocol" \
+            -m socket --transparent --nowildcard -j ACCEPT || return 1
+        # The transparent listener is not a public explicit proxy service.
+        ipt "$family" -t filter -A $IN_CHAIN -p "$protocol" --dport "$PORT" -j REJECT || return 1
+    done
+}
+
+attach() {
+    build_family iptables || return 1
+    build_family ip6tables || return 1
+    ipt iptables -t nat -N $NAT_CHAIN || return 1
+    # Avoid AdGuard's DNS DNAT only on packets already owned by this gateway.
+    ipt iptables -t nat -A $NAT_CHAIN -m mark --mark "$MARK" -j ACCEPT || return 1
+    ip -4 route add local 0.0.0.0/0 dev lo table "$TABLE" || return 1
+    ip -6 route add local ::/0 dev lo table "$TABLE" || return 1
+    for family in -4 -6; do
+        ip "$family" rule add priority "$PREF" iif "$LAN" fwmark "$MARK" table "$TABLE" || return 1
+    done
+    for family in iptables ip6tables; do
+        ipt "$family" -t filter -I INPUT 1 -j $IN_CHAIN || return 1
+    done
+    ipt iptables -t nat -I PREROUTING 1 -i "$LAN" -j $NAT_CHAIN || return 1
+    # Publish interception only after the core, watchdog, routes and filters exist.
+    ipt iptables -t mangle -I PREROUTING 1 -i "$LAN" -j $PRE_CHAIN || return 1
+    ipt ip6tables -t mangle -I PREROUTING 1 -i "$LAN" -j $PRE_CHAIN || return 1
+}
+
+watchdog() {
+    token=$1
+    while [ "$(cat "$RUN/session" 2>/dev/null)" = "$token" ]; do
+        reason=''
+        core_alive || reason='core exited'
+        deadline=$(cat "$RUN/deadline" 2>/dev/null)
+        case "$deadline" in
+            ''|*[!0-9]*) reason='invalid lease';;
+            0) :;;
+            *) [ "$(monotonic)" -lt "$deadline" ] || reason='trial expired';;
+        esac
+        if [ -n "$reason" ]; then
+            say "$(date): $reason; removing gateway rules."
+            # _expire may find that confirm won the control lock. Keep watching
+            # until the session disappears rather than exiting on that no-op.
+            "$SELF" _expire "$token" "$reason" || :
+        fi
+        sleep 2
+    done
+}
+
+start_all() {
+    seconds=${1:-180}
+    case "$seconds" in ''|*[!0-9]*) die 'Lease must be 30..3600 seconds.';; esac
+    [ "$seconds" -ge 30 ] && [ "$seconds" -le 3600 ] || die 'Lease must be 30..3600 seconds.'
+    preflight
+    assert_vacant
+    stamp=$(date +%Y%m%d-%H%M%S)-$$
+    backup="$BASE/backups/$stamp"
+    mkdir -p "$backup" || die 'Cannot create backup.'
+    iptables-save > "$backup/iptables.txt" || die 'Cannot snapshot IPv4 firewall.'
+    ip6tables-save > "$backup/ip6tables.txt" || die 'Cannot snapshot IPv6 firewall.'
+    ip -4 rule show > "$backup/ip4-rules.txt"
+    ip -6 rule show > "$backup/ip6-rules.txt"
+    ip -4 route show table all > "$backup/ip4-routes.txt"
+    ip -6 route show table all > "$backup/ip6-routes.txt"
+    [ ! -f "$LOG/core.log" ] || mv -f "$LOG/core.log" "$LOG/core.previous.log"
+    setsid "$CORE" run -D "$BASE" -c "$BASE/config.json" \
+        </dev/null >>"$LOG/core.log" 2>&1 9>&- &
+    echo "$!" > "$RUN/core.pid"
+    n=0
+    ready=0
+    while [ "$n" -lt 10 ]; do
+        if core_alive && ss -lntp | grep ":$PORT " | grep -q "pid=$CPID," && \
+           ss -lnup | grep ":$PORT " | grep -q "pid=$CPID,"; then
+            ready=1
+            break
+        fi
+        kill -0 "$(cat "$RUN/core.pid")" 2>/dev/null || break
+        sleep 1
+        n=$((n + 1))
+    done
+    if [ "$ready" != 1 ]; then
+        stop_core
+        die "Core did not open TCP+UDP $PORT. See log/core.log; no firewall was changed."
+    fi
+    echo "$stamp" > "$RUN/session"
+    echo $(( $(monotonic) + seconds )) > "$RUN/deadline"
+    # Claim only after all collision checks, before any firewall/route mutation.
+    echo "$stamp" > "$RUN/owned"
+    setsid /system/bin/sh "$SELF" _watchdog "$stamp" </dev/null >>"$LOG/watchdog.log" 2>&1 9>&- &
+    echo "$!" > "$RUN/watchdog.pid"
+    if ! kill -0 "$(cat "$RUN/watchdog.pid")" 2>/dev/null; then
+        stop_all
+        die 'Watchdog could not start.'
+    fi
+    trap 'stop_all; exit 1' HUP INT TERM
+    if ! attach; then
+        stop_all
+        die 'Attach failed; rollback requested. Check status.'
+    fi
+    trap - HUP INT TERM
+    say "Started for $seconds seconds (IPv4+IPv6 TCP/UDP, DNS)."
+    say 'After verifying clients, run: ./f50-proxy confirm'
+}
+
+show_status() {
+    if core_alive; then say "core: running (pid $CPID)"; else say 'core: stopped'; fi
+    if [ -r "$RUN/deadline" ]; then
+        deadline=$(cat "$RUN/deadline")
+        if [ "$deadline" = 0 ]; then say 'lease: confirmed (watchdog active)'
+        else say "lease: $((deadline - $(monotonic))) seconds remaining"; fi
+    fi
+    if [ -f "$RUN/owned" ]; then say 'gateway: session owns rules'; else say 'gateway: inactive'; fi
+    autostart_status
+    for family in iptables ip6tables; do
+        ipt "$family" -t mangle -L $PRE_CHAIN -n -v 2>/dev/null || :
+    done
+    ip -4 rule show | grep "^$PREF:" || :
+    ip -6 rule show | grep "^$PREF:" || :
+}
+
+usage() {
+    say 'Usage: f50-proxy {check|start [30..3600 seconds]|confirm|stop|restart [seconds]|status|logs|autostart {on|off|status}|core ARGS...}'
+    say 'start defaults to 180s and rolls back automatically unless confirmed.'
+    say 'core forwards all arguments to the original sing-box binary.'
+}
+
+command=${1:-help}
+shift $(( $# > 0 ? 1 : 0 ))
+case "$command" in
+    core) exec "$CORE" "$@";;
+    _boot) exec /system/bin/sh "$BASE/boot-start.sh";;
+    _boot-config) printf 'LAN_INTERFACE=%s\nLOCAL_TEST_PORT=%s\n' "$LAN" "$LOCAL_PORT"; exit;;
+    _alive) core_alive; exit $?;;
+    _watchdog) watchdog "$1"; exit;;
+    logs) tail -n "${1:-60}" "$LOG/core.log"; exit;;
+    help|-h|--help) usage; exit;;
+esac
+[ "$(id -u)" = 0 ] || die 'Root is required.'
+mkdir -p "$RUN" "$LOG" || die 'Cannot create runtime directories.'
+# Read-only status does not contend with a start/rollback transaction.
+case "$command" in status) show_status; exit;; check) preflight; exit;; esac
+exec 9>"$RUN/control.lock"
+# Expiry waits for a start/stop transaction to finish; public commands fail fast.
+# Android sh marks saved descriptors close-on-exec unless explicitly redirected.
+if [ "$command" = _expire ]; then flock 9 9>&9 || exit 1
+else flock -n 9 9>&9 || die 'Another control operation is running.'; fi
+case "$command" in
+    start) start_all "${1:-180}";;
+    stop) stop_all || exit 1;;
+    restart) stop_all && start_all "${1:-180}";;
+    autostart) autostart_switch "${1:-status}" || exit 1;;
+    confirm) confirm_session;;
+    _boot-start)
+        [ ! -e "$BASE/autostart.disabled" ] || exit 4
+        core_alive && exit 3
+        stop_all || exit 1
+        start_all "${1:-120}" || exit 1
+        printf 'BOOT_SESSION=%s\n' "$(cat "$RUN/session")";;
+    _boot-confirm)
+        [ "$(cat "$RUN/session" 2>/dev/null)" = "${1:-}" ] && [ ! -e "$BASE/autostart.disabled" ] || exit 1
+        confirm_session;;
+    _boot-stop)
+        [ "$(cat "$RUN/session" 2>/dev/null)" = "${1:-}" ] || exit 0
+        stop_all || exit 1;;
+    _expire)
+        [ "$(cat "$RUN/session" 2>/dev/null)" = "$1" ] || exit 0
+        # A queued expiry must not undo a confirmation completed under this lock.
+        if core_alive; then
+            deadline=$(cat "$RUN/deadline" 2>/dev/null)
+            case "$deadline" in
+                0) exit 0;;
+                ''|*[!0-9]*) :;;
+                *) [ "$(monotonic)" -ge "$deadline" ] || exit 0;;
+            esac
+        fi
+        stop_all || exit 1;;
+    *) usage; exit 1;;
+esac

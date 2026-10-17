@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "zte-f50",
+  "display_name": "ZTE F50",
+  "description": "Rooted ZTE F50 Android arm64 hotspot gateway",
+  "ssh_host": "f50",
+  "remote_root": "/data/local/f50-sing-box",
+  "platform": "android-arm64",
+  "autostart": {
+    "backend": "external-script",
+    "hook_path": "/sdcard/ufi_tools_boot.sh"
+  },
+  "ports": {
+    "tproxy": 7893,
+    "local_test": 7890
+  },
+  "network": {
+    "lan_interface": "br0",
+    "mark": "0x40000000/0x40000000",
+    "route_table": 20250,
+    "rule_priority": 1000,
+    "chain_prefix": "F50SB"
+  },
+  "shell_config": "zte-f50/profile.conf"
+}
