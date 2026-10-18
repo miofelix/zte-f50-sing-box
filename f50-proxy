@@ -166,22 +166,60 @@ stop_all() {
 autostart_metadata() {
     AUTOSTART_BACKEND=none
     AUTOSTART_HOOK=none
+    AUTOSTART_FALLBACK_HOOK=none
     [ -r "$BASE/autostart.conf" ] || return 0
     while IFS='=' read -r autostart_key autostart_value; do
         case "$autostart_key" in
             AUTOSTART_BACKEND)
                 case "$autostart_value" in external-script|none) AUTOSTART_BACKEND=$autostart_value;; *) return 1;; esac;;
-            AUTOSTART_HOOK)
+            AUTOSTART_HOOK|AUTOSTART_FALLBACK_HOOK)
                 case "$autostart_value" in
                     none) :;;
                     /data/*|/sdcard/*)
                         case "$autostart_value" in *[!A-Za-z0-9_./-]*|*/../*|*/./*) return 1;; esac;;
                     *) return 1;;
                 esac
-                AUTOSTART_HOOK=$autostart_value;;
+                case "$autostart_key" in
+                    AUTOSTART_HOOK) AUTOSTART_HOOK=$autostart_value;;
+                    AUTOSTART_FALLBACK_HOOK) AUTOSTART_FALLBACK_HOOK=$autostart_value;;
+                esac;;
             *) return 1;;
         esac
     done < "$BASE/autostart.conf"
+}
+
+boot_hook_health() {
+    boot_hook=$1
+    HOOK_HEALTH=unreadable
+    if [ ! -f "$boot_hook" ] || [ -L "$boot_hook" ]; then
+        HOOK_HEALTH=missing-or-unsafe; return 1
+    fi
+    boot_hook_size=$(wc -c < "$boot_hook") || return 1
+    if [ "$boot_hook_size" -eq 0 ] || [ "$boot_hook_size" -gt 262144 ]; then
+        HOOK_HEALTH=invalid-size; return 1
+    fi
+    # Android sh -n accepts NUL-filled files, so check bytes separately.
+    if [ "$(LC_ALL=C tr -d '\000' < "$boot_hook" | wc -c)" -ne "$boot_hook_size" ]; then
+        HOOK_HEALTH=corrupt-NUL-bytes; return 1
+    fi
+    if ! /system/bin/sh -n "$boot_hook" 2>/dev/null; then
+        HOOK_HEALTH=invalid-shell; return 1
+    fi
+    if ! awk -v entry="$BASE/boot-start.sh" '
+      index($0, "# BEGIN ZTE-F50-SINGBOX AUTOSTART") {
+        if ($0 != "# BEGIN ZTE-F50-SINGBOX AUTOSTART" || first || last) bad=1
+        first=NR
+      }
+      first && !last && index($0, entry) { found=1 }
+      index($0, "# END ZTE-F50-SINGBOX AUTOSTART") {
+        if ($0 != "# END ZTE-F50-SINGBOX AUTOSTART" || !first || last) bad=1
+        last=NR
+      }
+      END { if (bad || !first || !last || !found) exit 1 }
+    ' "$boot_hook"; then
+        HOOK_HEALTH=missing-or-invalid-entry; return 1
+    fi
+    HOOK_HEALTH=healthy
 }
 
 autostart_status() {
@@ -190,7 +228,17 @@ autostart_status() {
     elif [ -e "$BASE/autostart.disabled" ]; then say 'autostart: off'; else say 'autostart: on (default)'; fi
     say "boot backend: $AUTOSTART_BACKEND"
     say "boot hook: $AUTOSTART_HOOK"
-    if [ -r "$RUN/boot.result" ]; then say "last boot: $(cat "$RUN/boot.result")"; fi
+    if [ "$AUTOSTART_BACKEND" = external-script ]; then
+        boot_hook_health "$AUTOSTART_HOOK" || :
+        say "boot hook health: $HOOK_HEALTH"
+        if [ "$AUTOSTART_FALLBACK_HOOK" != none ]; then
+            boot_hook_health "$AUTOSTART_FALLBACK_HOOK" || :
+            say "fallback hook: $AUTOSTART_FALLBACK_HOOK ($HOOK_HEALTH)"
+        fi
+    fi
+    if [ "$(cat "$RUN/boot.attempt" 2>/dev/null)" != "$(cat /proc/sys/kernel/random/boot_id)" ]; then
+        say 'last boot: not attempted in this boot'
+    elif [ -r "$RUN/boot.result" ]; then say "last boot: $(cat "$RUN/boot.result")"; fi
 }
 
 autostart_switch() {
@@ -198,10 +246,9 @@ autostart_switch() {
         on)
             autostart_metadata || return 1
             [ "$AUTOSTART_BACKEND" = external-script ] && [ -x "$BASE/boot-start.sh" ] && \
-                [ -r "$AUTOSTART_HOOK" ] && \
-                grep -Fqx '# BEGIN ZTE-F50-SINGBOX AUTOSTART' "$AUTOSTART_HOOK" && \
-                grep -Fq "$BASE/boot-start.sh" "$AUTOSTART_HOOK" || {
-                    say 'Boot hook is not installed. Run: python3 deploy.py autostart on' >&2; return 1;
+                boot_hook_health "$AUTOSTART_HOOK" && \
+                { [ "$AUTOSTART_FALLBACK_HOOK" = none ] || boot_hook_health "$AUTOSTART_FALLBACK_HOOK"; } || {
+                    say 'Boot hook is missing or damaged. Restore a verified backup, then run: python3 deploy.py autostart on' >&2; return 1;
                 }
             rm -f "$BASE/autostart.disabled"
             say 'Autostart enabled. The current gateway session is unchanged.';;
@@ -390,13 +437,22 @@ start_all() {
 }
 
 show_status() {
-    if core_alive; then say "core: running (pid $CPID)"; else say 'core: stopped'; fi
+    status_core=stopped
+    status_guard=stopped
+    if core_alive; then status_core=running; say "core: running (pid $CPID)"; else say 'core: stopped'; fi
+    if guard_alive; then status_guard=running; fi
+    say "watchdog: $status_guard"
     if [ -r "$RUN/deadline" ]; then
         deadline=$(cat "$RUN/deadline")
-        if [ "$deadline" = 0 ]; then say 'lease: confirmed (watchdog active)'
+        if [ "$status_core" != running ] || [ "$status_guard" != running ]; then
+            say 'lease: stale (core or watchdog is not running)'
+        elif [ "$deadline" = 0 ]; then say 'lease: confirmed (watchdog active)'
         else say "lease: $((deadline - $(monotonic))) seconds remaining"; fi
     fi
-    if [ -f "$RUN/owned" ]; then say 'gateway: session owns rules'; else say 'gateway: inactive'; fi
+    if [ -f "$RUN/owned" ]; then
+        if [ "$status_core" = running ] && [ "$status_guard" = running ]; then say 'gateway: session owns rules'
+        else say 'gateway: inactive (stale ownership record)'; fi
+    else say 'gateway: inactive'; fi
     autostart_status
     for family in iptables ip6tables; do
         ipt "$family" -t mangle -L $PRE_CHAIN -n -v 2>/dev/null || :

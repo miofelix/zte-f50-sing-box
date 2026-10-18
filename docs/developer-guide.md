@@ -46,9 +46,11 @@ profile JSON 定义设备身份、SSH、部署目录、平台、入站端口和�
 
 ## 开机启动
 
-`autostart.py` 向 profile 指定的 root 启动脚本注册标记块。F50 使用 UFI/Samba 执行的 `/sdcard/ufi_tools_boot.sh`，该启动链是设备环境要求。
+`autostart.py` 向 profile 指定的 root 启动脚本注册标记块。F50 使用 UFI/Samba 执行的 `/sdcard/ufi_tools_boot.sh`，并通过 `/sdcard/ufi_tools_schedule.sh` 补上未触发的启动。该启动链是设备环境要求。
 
-注册操作检查入口类型、大小、shell 语法和标记完整性。项目只维护自己的标记块，保留其他脚本内容、inode、属主和权限，并在 `backups/` 保存 `0600` 备份。重复执行注册应得到相同内容；畸形、重复或不完整的标记必须拒绝。
+注册操作先检查所有声明入口的类型、大小、NUL 字节、shell 语法和标记完整性，再修改文件。项目只维护自己的标记块，保留其他脚本内容、inode、属主和权限，并在 `backups/` 保存 `0600` 备份。覆盖入口前同步完整候选文件和备份，写入并比对后再次同步；失败时恢复备份并同步。重复注册应得到相同内容；损坏文件及畸形、重复或不完整的标记必须拒绝。
+
+入口在本次 boot ID 已处理时直接返回，因此周期调度不会重复创建后台任务。`status` 检查核心和 watchdog 的真实身份、两个入口的完整性以及 boot.attempt 对应的 boot ID；持久化旧状态不能作为运行正常的依据。
 
 自启动开关通过 `autostart.disabled` 表示：文件不存在时开启，存在时关闭。电脑端 `autostart on` 注册入口并移除该标记；设备端命令管理开关。部署操作不改变禁用标记。
 

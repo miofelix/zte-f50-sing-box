@@ -21,14 +21,21 @@ def validate_autostart(value):
     """Return optional adapter metadata without interpreting any shell input."""
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) != {"backend", "hook_path"}:
+    required = {"backend", "hook_path"}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or set(value) - required - {"fallback_hook_path"}):
         raise SetupError("Profile autostart must contain backend and hook_path")
     if value["backend"] != "external-script":
         raise SetupError("Unsupported autostart backend; use external-script")
-    path = value["hook_path"]
-    if (not isinstance(path, str) or not _HOOK_PATH.fullmatch(path)
-            or any(part in (".", "..") for part in path.split("/"))):
-        raise SetupError("Autostart hook_path must be a safe file below /data or /sdcard")
+    for key in ("hook_path", "fallback_hook_path"):
+        if key not in value:
+            continue
+        path = value[key]
+        if (not isinstance(path, str) or not _HOOK_PATH.fullmatch(path)
+                or any(part in (".", "..") for part in path.split("/"))):
+            raise SetupError(f"Autostart {key} must be a safe file below /data or /sdcard")
+    if value.get("fallback_hook_path") == value["hook_path"]:
+        raise SetupError("Autostart fallback hook must differ from the primary hook")
     return dict(value)
 
 
@@ -38,8 +45,10 @@ def hook_block(base):
     disabled = shlex.quote(base + "/autostart.disabled")
     log_dir = shlex.quote(base + "/log")
     log_file = shlex.quote(base + "/log/boot.log")
+    attempt = shlex.quote(base + "/run/boot.attempt")
     return f"""{BEGIN_MARKER}
-if [ -f {entry} ] && [ ! -e {disabled} ]; then
+if [ -f {entry} ] && [ ! -e {disabled} ] &&
+   [ "$(cat /proc/sys/kernel/random/boot_id)" != "$(cat {attempt} 2>/dev/null)" ]; then
   if command -v setsid >/dev/null 2>&1 && mkdir -p {log_dir}; then
     setsid /system/bin/sh {entry} </dev/null >>{log_file} 2>&1 &
   fi
@@ -53,8 +62,18 @@ def render_autostart_config(profile):
     adapter = validate_autostart(profile.get("autostart"))
     if adapter is None:
         return "AUTOSTART_BACKEND=none\nAUTOSTART_HOOK=none\n"
-    return ("AUTOSTART_BACKEND=external-script\n"
-            f"AUTOSTART_HOOK={adapter['hook_path']}\n")
+    metadata = ("AUTOSTART_BACKEND=external-script\n"
+                f"AUTOSTART_HOOK={adapter['hook_path']}\n")
+    if "fallback_hook_path" in adapter:
+        metadata += f"AUTOSTART_FALLBACK_HOOK={adapter['fallback_hook_path']}\n"
+    return metadata
+
+
+def _hook_paths(adapter):
+    paths = [adapter["hook_path"]]
+    if "fallback_hook_path" in adapter:
+        paths.append(adapter["fallback_hook_path"])
+    return paths
 
 
 def hook_preflight_script(profile):
@@ -62,13 +81,21 @@ def hook_preflight_script(profile):
     adapter = validate_autostart(profile.get("autostart"))
     if adapter is None:
         return ""
+    return "".join(_hook_preflight_script(path) for path in _hook_paths(adapter))
+
+
+def _hook_preflight_script(path):
     return f"""(
-hook={shlex.quote(adapter['hook_path'])}
+hook={shlex.quote(path)}
 test -f "$hook" && test ! -L "$hook" || {{
   echo 'Autostart requires an existing regular boot hook; no loader was installed' >&2; exit 1;
 }}
 test "$(wc -c < "$hook")" -le 262144 || {{ echo 'Boot hook exceeds 256 KiB' >&2; exit 1; }}
+test "$(LC_ALL=C tr -d '\\000' < "$hook" | wc -c)" -eq "$(wc -c < "$hook")" || {{
+  echo "Boot hook contains NUL bytes; restore a verified backup: $hook" >&2; exit 1;
+}}
 command -v setsid >/dev/null 2>&1 || {{ echo 'Boot hook requires setsid' >&2; exit 1; }}
+command -v sync >/dev/null 2>&1 || {{ echo 'Boot hook requires sync' >&2; exit 1; }}
 /system/bin/sh -n "$hook" || {{ echo 'Existing boot hook has invalid shell syntax' >&2; exit 1; }}
 awk -v first={shlex.quote(BEGIN_MARKER)} -v last={shlex.quote(END_MARKER)} '
   index($0, first) {{ if ($0 != first || begin || end) bad=1; begin=NR; }}
@@ -89,15 +116,26 @@ def hook_install_script(profile):
     adapter = validate_autostart(profile.get("autostart"))
     if adapter is None:
         return "echo 'Profile has no boot adapter; autostart was not registered'\n"
+    # Check every declared entry before changing either one.
+    return hook_preflight_script(profile) + "".join(
+        _hook_install_script(profile, path, index)
+        for index, path in enumerate(_hook_paths(adapter))
+    )
+
+
+def _hook_install_script(profile, path, index):
     base = profile_remote(profile)
     block = hook_block(base)
     # This literal delimiter cannot occur in a validated base path.
     return f"""(
-hook={shlex.quote(adapter['hook_path'])}
+hook={shlex.quote(path)}
 test -f "$hook" && test ! -L "$hook" || {{
   echo 'Autostart requires an existing regular boot hook; no loader was installed' >&2; exit 1;
 }}
 test "$(wc -c < "$hook")" -le 262144 || {{ echo 'Boot hook exceeds 256 KiB' >&2; exit 1; }}
+test "$(LC_ALL=C tr -d '\\000' < "$hook" | wc -c)" -eq "$(wc -c < "$hook")" || {{
+  echo "Boot hook contains NUL bytes; restore a verified backup: $hook" >&2; exit 1;
+}}
 command -v setsid >/dev/null 2>&1 || {{ echo 'Boot hook requires setsid' >&2; exit 1; }}
 /system/bin/sh -n "$hook" || {{ echo 'Existing boot hook has invalid shell syntax' >&2; exit 1; }}
 pending="$base/.boot-hook.$$"
@@ -108,6 +146,7 @@ hook_writing=0
 cleanup_hook() {{
   if [ "$hook_writing" = 1 ] && [ -n "$backup" ]; then
     cat "$backup" > "$hook" || echo "Restore failed; inspect $backup" >&2
+    sync || echo "Sync failed; inspect $backup" >&2
   fi
   rm -f "$pending" "$original" "$block"
 }}
@@ -115,6 +154,9 @@ trap cleanup_hook EXIT
 trap 'exit 1' HUP INT TERM
 cat "$hook" > "$original"
 chmod 600 "$original"
+test "$(LC_ALL=C tr -d '\\000' < "$original" | wc -c)" -eq "$(wc -c < "$original")" || {{
+  echo 'Captured boot hook contains NUL bytes; nothing was installed' >&2; exit 1;
+}}
 # Reject partial, duplicate, reversed, or non-literal marker lines.
 positions=$(awk -v first={shlex.quote(BEGIN_MARKER)} -v last={shlex.quote(END_MARKER)} '
   index($0, first) {{ if ($0 != first || begin || end) bad=1; begin=NR; }}
@@ -143,10 +185,12 @@ if cmp -s "$original" "$pending"; then
 fi
 mkdir -p "$base/backups"
 chmod 700 "$base/backups"
-backup="$base/backups/boot-hook.$(date +%Y%m%d-%H%M%S).$$.sh"
+backup="$base/backups/boot-hook.$(date +%Y%m%d-%H%M%S).$$.{index}.sh"
 test ! -e "$backup" || {{ echo 'Boot-hook backup collision; nothing changed' >&2; exit 1; }}
 cp "$original" "$backup"
 chmod 600 "$backup"
+# Persist the complete candidate and recovery copy before truncating the hook.
+sync
 cmp -s "$hook" "$original" || {{ echo 'Boot hook changed during registration; retry after review' >&2; exit 1; }}
 # Keep the existing hook inode, ownership, and permissions (including sdcard).
 hook_writing=1
@@ -157,6 +201,7 @@ fi
 cmp -s "$pending" "$hook" || {{
   echo 'Boot-hook verification failed; restoring its backup' >&2; exit 1;
 }}
+sync
 hook_writing=0
 echo "Registered boot hook; backup: $backup"
 )

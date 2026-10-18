@@ -9,7 +9,7 @@ make test-unit
 # PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-`make check` 验证 Python/Shell 语法、profile 加载和 CLI 入口。`make test-unit` 验证启动入口注册、备份、元数据完整性、开关持久化、网络等待、健康检查、重复触发及会话并发保护。
+`make check` 验证 Python/Shell 语法、profile 加载和 CLI 入口。`make test-unit` 验证主/备用入口注册、NUL 损坏拒绝、备份与同步失败恢复、旧状态识别、元数据完整性、开关持久化、网络等待、健康检查、重复触发及会话并发保护。
 
 单元测试使用临时文件与桩，不连接设备。
 

@@ -8,7 +8,8 @@
   "platform": "android-arm64",
   "autostart": {
     "backend": "external-script",
-    "hook_path": "/sdcard/ufi_tools_boot.sh"
+    "hook_path": "/sdcard/ufi_tools_boot.sh",
+    "fallback_hook_path": "/sdcard/ufi_tools_schedule.sh"
   },
   "ports": {
     "tproxy": 7893,

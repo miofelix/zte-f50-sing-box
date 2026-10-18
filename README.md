@@ -42,7 +42,7 @@ python3 deploy.py autostart off
 
 开关状态持久保存。设备内可执行 `./f50-proxy autostart on|off|status`；停止正在运行的代理使用 `./f50-proxy stop`。
 
-开机任务等待系统、热点和上行网络就绪，启动试运行并执行联网检查，通过后自动确认；失败则清理该任务创建的会话。F50 使用 UFI/Samba 以 root 执行的 `/sdcard/ufi_tools_boot.sh` 触发该任务。部署程序在此脚本中注册项目入口，具体适配方式见 [设备适配](docs/device-profiles.md)。
+开机任务等待系统、热点和上行网络就绪，启动试运行并执行联网检查，通过后自动确认；失败则清理该任务创建的会话。F50 使用 UFI/Samba 以 root 执行的 `/sdcard/ufi_tools_boot.sh` 触发任务，并通过 `/sdcard/ufi_tools_schedule.sh` 补上本次开机尚未触发的启动。部署程序注册两个入口，具体适配方式见 [设备适配](docs/device-profiles.md)。
 
 ## 设备与配置
 

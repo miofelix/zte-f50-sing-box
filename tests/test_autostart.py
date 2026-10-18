@@ -29,11 +29,15 @@ class HookRegistrationTests(unittest.TestCase):
         self.base = self.root / "gateway"
         self.base.mkdir()
         self.hook = self.root / "existing-boot.sh"
+        self.fallback = self.root / "existing-schedule.sh"
         self.bin = self.root / "bin"
         self.bin.mkdir()
         setsid = self.bin / "setsid"
         setsid.write_text("#!/bin/sh\nexit 0\n")
         setsid.chmod(0o700)
+        sync = self.bin / "sync"
+        sync.write_text('#!/bin/sh\nprintf "sync\\n" >> "$TEST_SYNC_LOG"\n')
+        sync.chmod(0o700)
         self.profile = {
             "remote_root": str(self.base),
             "autostart": {"backend": "external-script", "hook_path": "/sdcard/test-boot.sh"},
@@ -46,8 +50,10 @@ class HookRegistrationTests(unittest.TestCase):
         # registration, marker checks, backups and writes execute unchanged.
         fragment = fragment.replace("/system/bin/sh -n", "/bin/sh -n")
         fragment = fragment.replace("hook=/sdcard/test-boot.sh", "hook=" + shlex.quote(str(self.hook)))
+        fragment = fragment.replace("hook=/sdcard/test-schedule.sh", "hook=" + shlex.quote(str(self.fallback)))
         script = "set -eu\numask 077\nbase=" + shlex.quote(str(self.base)) + "\n" + fragment
-        env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
+        env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                   TEST_SYNC_LOG=str(self.root / "sync.log"))
         return subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, env=env)
 
     def test_install_preserves_existing_content_inode_permissions_and_private_backup(self):
@@ -70,6 +76,100 @@ class HookRegistrationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
         self.assertFalse(sentinel.exists(), "installer must never execute an existing hook")
         self.assertFalse((self.base / "autostart.disabled").exists(), "fresh install defaults to enabled")
+        self.assertEqual((self.root / "sync.log").read_text().splitlines(), ["sync", "sync"])
+
+    def test_nul_bytes_are_rejected_before_backup_or_write(self):
+        for content in (b"\0" * 1825 + b": intact-tail\n", b"#!/bin/sh\n# a\0b\n", b"\0" * 200):
+            with self.subTest(content=content[:20]):
+                self.hook.write_bytes(content)
+                for preflight in (True, False):
+                    result = self.run_script(preflight=preflight)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("NUL bytes", result.stderr)
+                    self.assertEqual(self.hook.read_bytes(), content)
+                self.assertFalse((self.base / "backups").exists())
+
+    def test_sync_failure_before_write_leaves_hook_untouched(self):
+        original = b"#!/bin/sh\n: original\n"
+        self.hook.write_bytes(original)
+        (self.bin / "sync").write_text("#!/bin/sh\nexit 1\n")
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.hook.read_bytes(), original)
+        self.assertEqual(next((self.base / "backups").iterdir()).read_bytes(), original)
+
+    def test_corruption_during_capture_is_not_installed_or_kept_as_backup(self):
+        original = b"#!/bin/sh\n: original\n"
+        self.hook.write_bytes(original)
+        cat = self.bin / "cat"
+        cat.write_text('#!/bin/sh\ncase "$1" in\n'
+                       '  */existing-boot.sh) printf "\\000";;\n'
+                       'esac\nexec /bin/cat "$@"\n')
+        cat.chmod(0o700)
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Captured boot hook contains NUL bytes", result.stderr)
+        self.assertEqual(self.hook.read_bytes(), original)
+        self.assertFalse((self.base / "backups").exists())
+
+    def test_sync_failure_after_write_restores_original(self):
+        original = b"#!/bin/sh\n: original\n"
+        self.hook.write_bytes(original)
+        (self.bin / "sync").write_text(
+            '#!/bin/sh\nprintf "sync\\n" >> "$TEST_SYNC_LOG"\n'
+            'test "$(wc -l < "$TEST_SYNC_LOG")" -ne 2\n')
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.hook.read_bytes(), original)
+        self.assertEqual(len((self.root / "sync.log").read_text().splitlines()), 3)
+
+    def test_primary_and_fallback_are_registered_and_remain_idempotent(self):
+        self.profile["autostart"]["fallback_hook_path"] = "/sdcard/test-schedule.sh"
+        self.hook.write_text("#!/bin/sh\n: primary-task\n")
+        self.fallback.write_text("#!/bin/sh\n: schedule-task\n")
+        first = self.run_script()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        originals = [path.read_bytes() for path in (self.hook, self.fallback)]
+        backups = list((self.base / "backups").iterdir())
+        self.assertEqual(len(backups), 2)
+        for content in originals:
+            self.assertEqual(content.count(BEGIN_MARKER.encode()), 1)
+        second = self.run_script()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual([path.read_bytes() for path in (self.hook, self.fallback)], originals)
+        self.assertEqual(list((self.base / "backups").iterdir()), backups)
+
+    def test_invalid_fallback_is_rejected_before_changing_primary(self):
+        self.profile["autostart"]["fallback_hook_path"] = "/sdcard/test-schedule.sh"
+        original = b"#!/bin/sh\n: primary-task\n"
+        self.hook.write_bytes(original)
+        self.fallback.write_bytes(b"\0" * 200)
+        result = self.run_script()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.hook.read_bytes(), original)
+        self.assertFalse((self.base / "backups").exists())
+
+    def test_repeated_hook_preserves_handled_boot_and_disabled_preference(self):
+        entry = self.base / "boot-start.sh"
+        entry.touch()
+        run = self.base / "run"
+        run.mkdir()
+        calls = self.root / "hook-calls"
+        (self.bin / "setsid").write_text('#!/bin/sh\nprintf "start\\n" >> "$TEST_HOOK_CALLS"\n')
+        script = hook_block(str(self.base)).replace("cat /proc/sys/kernel/random/boot_id", "printf boot-current")
+        env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"], TEST_HOOK_CALLS=str(calls))
+        def trigger():
+            result = subprocess.run(["/bin/sh", "-c", script + "\nwait\n"], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        trigger()
+        self.assertEqual(calls.read_text(), "start\n")
+        (run / "boot.attempt").write_text("boot-current\n")
+        trigger()
+        self.assertEqual(calls.read_text(), "start\n", "a fallback must not restart a manually stopped session")
+        (run / "boot.attempt").write_text("boot-previous\n")
+        (self.base / "autostart.disabled").touch()
+        trigger()
+        self.assertEqual(calls.read_text(), "start\n")
 
     def test_registration_is_idempotent_and_preserves_explicit_off(self):
         self.hook.write_text("#!/bin/sh\n# leave me here\n")
@@ -152,9 +252,11 @@ class AutostartProfileAndCliTests(unittest.TestCase):
         profile = load_profile("zte-f50")
         self.assertEqual(profile["autostart"], {
             "backend": "external-script", "hook_path": "/sdcard/ufi_tools_boot.sh",
+            "fallback_hook_path": "/sdcard/ufi_tools_schedule.sh",
         })
         self.assertEqual(render_autostart_config(profile),
-                         "AUTOSTART_BACKEND=external-script\nAUTOSTART_HOOK=/sdcard/ufi_tools_boot.sh\n")
+                         "AUTOSTART_BACKEND=external-script\nAUTOSTART_HOOK=/sdcard/ufi_tools_boot.sh\n"
+                         "AUTOSTART_FALLBACK_HOOK=/sdcard/ufi_tools_schedule.sh\n")
         self.assertEqual(render_autostart_config({}), "AUTOSTART_BACKEND=none\nAUTOSTART_HOOK=none\n")
 
     def test_adapter_rejects_protected_unsafe_and_parent_paths(self):
@@ -165,6 +267,10 @@ class AutostartProfileAndCliTests(unittest.TestCase):
         for value in ([], {}, {"backend": "init", "hook_path": "/data/boot.sh"}):
             with self.subTest(value=value), self.assertRaises(SetupError):
                 validate_autostart(value)
+        for fallback in ("/system/fallback.sh", "/data/../boot.sh", "/data/boot.sh", None):
+            with self.subTest(fallback=fallback), self.assertRaises(SetupError):
+                validate_autostart({"backend": "external-script", "hook_path": "/data/boot.sh",
+                                    "fallback_hook_path": fallback})
 
     @patch("zte_f50_singbox.autostart.ssh")
     def test_enable_repairs_hook_in_one_operation_and_invokes_device_toggle(self, remote):
